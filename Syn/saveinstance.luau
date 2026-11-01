@@ -3524,8 +3524,6 @@ local function synsaveinstance(...)
 		local decomp = decompile and makeTimeoutHandler(OPTIONS.DecompileTimeout, decompile, "Decompiler timed out")
 		local httpservice = cloneref and cloneref(game:GetService("HttpService")) or game:GetService("HttpService")
 		local lastApiRequest = 0
-		local apiRequestCount = 0
-		local apiDisabled = false
 		local function fallbackBase64Encode(data)
 			local alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 			return ((data:gsub(".", function(char)
@@ -3552,13 +3550,8 @@ local function synsaveinstance(...)
 			if not ok then
 				return "-- failed to read script bytecode\n--[[\n" .. tostring(bytecode) .. "\n--]]"
 			end
-			-- Fallback-only: conservatively space external requests.
-			if apiDisabled or apiRequestCount >= 60 then
-				return "-- lua.expert fallback disabled or session request budget exhausted"
-			end
 			local elapsed = os.clock() - lastApiRequest
-			if elapsed < 1 then task.wait(1 - elapsed) end
-			apiRequestCount += 1
+			if elapsed < 0.04 then task.wait(0.04 - elapsed) end
 			local encoder = base64encode or base64_encode or fallbackBase64Encode
 			local requestFunction = request or http_request or (syn and syn.request)
 			if not requestFunction then
@@ -3574,98 +3567,12 @@ local function synsaveinstance(...)
 			if not requestOk then
 				return "-- api request error\n--[[\n" .. tostring(response) .. "\n--]]"
 			end
-			if response and (response.StatusCode == 429 or response.StatusCode == 403) then
-				apiDisabled = true -- Never retry after rate-limit or access denial.
-			end
 			if not response or response.StatusCode ~= 200 then
 				return "-- api request error\n--[[\n" .. (response and tostring(response.Body) or "no response") .. "\n--]]"
 			end
 			return tostring(response.Body or "")
 		end
-		local ZUKA_URL = "https://raw.githubusercontent.com/richardsmallsgit-tech/Panel/main/Utilities/Zuka.luau"
-		local zukaFunction, zukaLoadError
-		local zukaLoading = false
-		local zukaReady = Instance.new("BindableEvent")
-		local function initializeZuka()
-			if zukaLoading then return end
-			zukaLoading = true
-			task.defer(function()
-				local ok, err = pcall(function()
-					local runtimeEnv = type(getgenv) == "function" and getgenv() or _G
-					local previousDecompile = runtimeEnv._ZUK_DECOMPILE
-					local source = game:HttpGet(ZUKA_URL, true)
-					assert(type(source) == "string" and #source > 0, "GitHub returned an empty Zuka.luau")
-					local compiler = loadstring or (env and env.loadstring)
-					assert(type(compiler) == "function", "loadstring unavailable")
-					local chunk, compileErr = compiler(source, "@Zuka.luau")
-					assert(type(chunk) == "function", "Zuka compilation failed: " .. tostring(compileErr))
-					chunk()
-					-- Zuka registers its API using task.defer; wait for the new registration.
-					local deadline = os.clock() + 15
-					repeat
-						local current = runtimeEnv._ZUK_DECOMPILE
-						if type(current) == "function" and current ~= previousDecompile then
-							zukaFunction = current
-							break
-						end
-						task.wait(0.1)
-					until os.clock() >= deadline
-					-- A preexisting registration is usable if Zuka reuses the same function.
-					if not zukaFunction and type(runtimeEnv._ZUK_DECOMPILE) == "function" then
-						zukaFunction = runtimeEnv._ZUK_DECOMPILE
-					end
-					assert(type(zukaFunction) == "function", "Zuka did not register _ZUK_DECOMPILE")
-				end)
-				if not ok then zukaLoadError = tostring(err) end
-				zukaReady:Fire()
-			end)
-		end
-		local function getZuka()
-			if zukaFunction then return zukaFunction end
-			if zukaLoadError then return nil, zukaLoadError end
-			initializeZuka()
-			-- Avoid a lost event if initialization finished before Wait().
-			while not zukaFunction and not zukaLoadError do
-				zukaReady.Event:Wait()
-			end
-			return zukaFunction, zukaLoadError
-		end
-		initializeZuka()
-		local function looksLikeFailure(result)
-			if type(result) ~= "string" or result:match("^%s*$") then return true end
-			local prefix = result:sub(1, 250):lower()
-			return prefix:find("failed to decompile", 1, true) ~= nil
-				or prefix:find("decompilation failed", 1, true) ~= nil
-				or prefix:find("decompiler error", 1, true) ~= nil
-				or prefix:find("-- error", 1, true) ~= nil
-				or prefix:find("-- unsupported", 1, true) ~= nil
-		end
-		local function zukaFirst(script)
-			local zuka, loadErr = getZuka()
-			local reason = loadErr
-			if zuka then
-				local ok, output = pcall(zuka, script)
-				if ok and not looksLikeFailure(output) then return output end
-				reason = tostring(output)
-				-- Bytecode-input implementations can be used without changing SaveInstance.
-				if getscriptbytecode then
-					local got, bytes = pcall(getscriptbytecode, script)
-					if got and type(bytes) == "string" and bytes ~= "" then
-						local byteOk, byteOutput = pcall(zuka, bytes)
-						if byteOk and not looksLikeFailure(byteOutput) then return byteOutput end
-						reason = tostring(byteOutput)
-					end
-				end
-			end
-			local apiOutput = apiDecompile(script)
-			if not looksLikeFailure(apiOutput) and not apiOutput:find("^%-%- api request error")
-				and not apiOutput:find("^%-%- lua%.expert fallback") then
-				return apiOutput
-			end
-			return "-- Zuka failed: " .. tostring(reason) .. "\n" .. tostring(apiOutput)
-		end
-		local zukaDecomp = makeTimeoutHandler(OPTIONS.DecompileTimeout, zukaFirst, "Decompiler timed out")
-
+		local apiDecomp = makeTimeoutHandler(OPTIONS.DecompileTimeout, apiDecompile, "Decompiler timed out")
 		ldecompile = function(script)
 			local bytecode
 			if ScriptCache then
@@ -3693,7 +3600,7 @@ local function synsaveinstance(...)
 					return "-- Not found in already decompiled ScriptCache"
 				end
 			end
-			local decompileFunction = zukaDecomp
+			local decompileFunction = (script:IsA("LocalScript") or script:IsA("ModuleScript")) and apiDecomp or decomp
 			if not decompileFunction then
 				return "-- Your Executor does NOT have a Decompiler"
 			end
